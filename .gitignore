@@ -1,0 +1,5 @@
+__pycache__/
+.venv/
+.soma-openclaw-venv/
+logs/
+.env

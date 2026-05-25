@@ -1,0 +1,11 @@
+{
+  "id": "soma-miner",
+  "kind": "context-engine",
+  "name": "SOMA Miner",
+  "description": "OpenClaw connector for the local SOMA Miner Python script.",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}
