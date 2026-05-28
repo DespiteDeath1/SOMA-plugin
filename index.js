@@ -1,6 +1,5 @@
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import path from "node:path";
-import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 
@@ -9,24 +8,10 @@ const PLUGIN_NAME = "SOMA Miner";
 const DEFAULT_REPLACE_TRAJECTORY = true;
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const PYTHON_SCRIPT = path.join(__dirname, "base_miner.py");
-const RUNTIME_VENV_PYTHON = path.join(__dirname, ".soma-openclaw-venv", "bin", "python");
-const LEGACY_VENV_PYTHON = path.join(__dirname, ".venv", "bin", "python");
 const CONNECTOR_STATE_FILE = path.join(__dirname, "connector-state.json");
 const IO_LOG_DIR = path.join(__dirname, "logs", "io");
 const RUNTIME_LOG_FILE = path.join(__dirname, "logs", "runtime-hooks.jsonl");
-const TIKTOKEN_CACHE_DIR = path.join(__dirname, "tiktoken-cache");
 const contextEngineSessionFiles = new Map();
-
-function resolvePythonExecutable() {
-  if (existsSync(RUNTIME_VENV_PYTHON)) {
-    return RUNTIME_VENV_PYTHON;
-  }
-  if (existsSync(LEGACY_VENV_PYTHON)) {
-    return LEGACY_VENV_PYTHON;
-  }
-  return "python3";
-}
 
 function cloneJson(value, fallback = null) {
   try {
@@ -188,61 +173,51 @@ function resolveContextEngineSessionFile(params = {}) {
   return null;
 }
 
-async function runPython(command, payload) {
-  const pythonExecutable = resolvePythonExecutable();
-  const childEnv = {
-    ...process.env,
-    PYTHONIOENCODING: "utf-8",
-    TIKTOKEN_CACHE_DIR,
-  };
+function resolveCompressionServiceUrl() {
+  const raw = typeof process.env.SOMA_COMPRESSION_SERVICE_URL === "string"
+    ? process.env.SOMA_COMPRESSION_SERVICE_URL.trim()
+    : "";
+  return raw || null;
+}
 
-  if (path.isAbsolute(pythonExecutable) && path.basename(path.dirname(pythonExecutable)) === "bin") {
-    const venvDir = path.dirname(path.dirname(pythonExecutable));
-    childEnv.VIRTUAL_ENV = venvDir;
-    childEnv.PATH = `${path.dirname(pythonExecutable)}:${childEnv.PATH ?? ""}`;
+async function callCompressionService(params) {
+  const serviceUrl = resolveCompressionServiceUrl();
+  if (!serviceUrl) {
+    throw new Error("SOMA_COMPRESSION_SERVICE_URL is not set — compression service URL is required");
   }
 
-  return await new Promise((resolve, reject) => {
-    const child = spawn(pythonExecutable, [PYTHON_SCRIPT, command], {
-      stdio: ["pipe", "pipe", "pipe"],
-      env: childEnv,
+  const messages = Array.isArray(params?.messages) ? params.messages : [];
+  const body = {
+    messages,
+    session_id: params?.sessionId ?? null,
+    session_key: params?.sessionKey ?? null,
+    current_token_count: Number.isFinite(params?.currentTokenCount) ? params.currentTokenCount : null,
+  };
+
+  let response;
+  try {
+    response = await fetch(`${serviceUrl}/compress`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
     });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`Compression service unreachable at ${serviceUrl}: ${message}`);
+  }
 
-    let stdout = "";
-    let stderr = "";
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(`Compression service returned HTTP ${response.status}: ${text.slice(0, 200)}`);
+  }
 
-    child.stdout.on("data", (chunk) => {
-      stdout += String(chunk);
-    });
-    child.stderr.on("data", (chunk) => {
-      stderr += String(chunk);
-    });
-    child.on("error", reject);
-    child.on("close", (code) => {
-      if (code !== 0) {
-        reject(new Error(stderr.trim() || `${PLUGIN_ID} python script exited with code ${code ?? "unknown"}`));
-        return;
-      }
+  const result = await response.json();
 
-      let parsed;
-      try {
-        parsed = JSON.parse(stdout.trim() || "{}");
-      } catch (error) {
-        reject(new Error(`Failed to parse ${PLUGIN_ID} python response: ${error.message}\n${stderr || stdout}`));
-        return;
-      }
+  if (!result.compress) {
+    return null;
+  }
 
-      if (parsed?.ok === false) {
-        reject(new Error(parsed.error || `${PLUGIN_ID} python script failed`));
-        return;
-      }
-
-      resolve(parsed);
-    });
-
-    child.stdin.write(JSON.stringify(payload));
-    child.stdin.end();
-  });
+  return result.trajectory ?? null;
 }
 
 async function setPluginEnabled(api, enabled) {
@@ -266,11 +241,6 @@ async function setPluginEnabled(api, enabled) {
 async function setConnectorTrajectoryMode(enabled) {
   const state = writeConnectorState({ replaceTrajectory: enabled });
   console.log(JSON.stringify({ ok: true, replaceTrajectory: state.replaceTrajectory }, null, 2));
-}
-
-async function runMinerAssemble(params) {
-  const response = await runPython("assemble", buildPayload(params, { sourceHook: "assemble" }));
-  return response.result;
 }
 
 function safeFilePart(value, fallback = "session") {
@@ -787,7 +757,21 @@ const somaMinerPlugin = {
           inputMessageCount: Array.isArray(currentParams.messages) ? currentParams.messages.length : 0,
         });
         try {
-          const minerTrajectory = await runMinerAssemble(currentParams);
+          const serviceResult = await callCompressionService(currentParams);
+          if (serviceResult === null) {
+            // Service decided not to compress.
+            writeRuntimeHookMarker("assemble:finish", {
+              sessionId: currentParams.sessionId ?? null,
+              sessionKey: currentParams.sessionKey ?? null,
+              sessionFile,
+              compress: false,
+              inputMessageCount: Array.isArray(currentParams.messages) ? currentParams.messages.length : 0,
+              outputMessageCount: Array.isArray(currentParams.messages) ? currentParams.messages.length : 0,
+            });
+            return buildPassThroughResult("assemble", currentParams);
+          }
+
+          const minerTrajectory = serviceResult;
           const replaceTrajectory = readConnectorState().replaceTrajectory;
           const useMinerTrajectory = replaceTrajectory && shouldUseMinerTrajectory(minerTrajectory);
           const trajectoryState = persistTrajectoryState(currentParams, minerTrajectory, {
@@ -800,6 +784,7 @@ const somaMinerPlugin = {
             sessionId: currentParams.sessionId ?? null,
             sessionKey: currentParams.sessionKey ?? null,
             sessionFile,
+            compress: true,
             replaceTrajectory,
             useMinerTrajectory,
             inputMessageCount: Array.isArray(currentParams.messages) ? currentParams.messages.length : 0,
