@@ -1,9 +1,20 @@
 #!/usr/bin/env python3
-"""SOMA miner for assemble-time trajectory pruning.
+"""SOMA miner — observation-masking context compressor for OpenClaw/qwen3-coder.
 
-Algorithmic (no-LLM) context compressor for OpenClaw/qwen3-coder SWE-bench agents.
-Key strategy: content-aware truncation + stale-read deduplication + smart result
-selection keeps the agent focused without losing solve-critical signals.
+Algorithm: pure observation masking (Lindenbauer et al., NeurIPS 2025).
+- The last OBSERVATION_MASK_WINDOW tool results keep their content (content-truncated).
+- ALL older tool results get their content replaced with a compact tombstone marker.
+- ALL message pairs are preserved (no structural dropping — this prevents flail).
+- ALL assistant messages are kept in full (the reasoning trace is the anti-flail signal).
+
+Empirical basis (arXiv 2508.21433, Table 1, Qwen3-Coder 480B):
+  Raw agent:              53.4% solve rate, $1.29/instance
+  Observation masking M=10: 54.8% solve rate (+2.6 pp), $0.61/instance (−52.7%)
+  LLM-Summary:            53.8% solve rate (+0.7%),  $0.64/instance (−50.4%)
+
+The +2.6 pp improvement over raw, with no LLM calls, is our jackpot conversion
+mechanism. The key: masking eliminates noisy old observations while preserving
+the full reasoning trace that prevents re-exploration (flail).
 """
 
 from __future__ import annotations
@@ -20,46 +31,35 @@ from typing import Any, Optional
 
 EVENT_NAMES = frozenset({"assemble"})
 
-# ── structural window ─────────────────────────────────────────────────────────
-# How many tool results to keep in the final compressed trajectory.
-# Raised from 4 → 6 so the agent keeps a broader recent horizon; content
-# truncation (below) compensates for the extra messages.
-KEEP_TOOL_RESULT_COUNT = 6
+# ── observation masking window ────────────────────────────────────────────────
+# Last N tool results keep their content (content-truncated).
+# All older tool results get a compact tombstone.
+# Empirically optimal at M=10 for Qwen3-Coder 480B (Lindenbauer et al. 2025).
+OBSERVATION_MASK_WINDOW = 10
 
-# ── per-result content limits (characters; ~4 chars ≈ 1 token) ───────────────
-# File-read results: keep structure (imports / class defs) from the head,
-# and the active editing region from the tail.
-READ_HEAD_CHARS = 2000   # ~500 tokens
-READ_TAIL_CHARS = 4000   # ~1000 tokens  (most-recent code is load-bearing)
-
-# Shell / exec results: environment line from head, errors/output from tail.
-EXEC_HEAD_CHARS = 800    # ~200 tokens
-EXEC_TAIL_CHARS = 4800   # ~1200 tokens  (errors live at the end)
-
-# Test-run results: critical – failing traceback is always at the tail.
-TEST_TAIL_CHARS = 10000  # ~2500 tokens  (keep full failure output)
-
-# Write / edit / patch results: usually small acknowledgements.
-WRITE_MAX_CHARS = 2000   # ~500 tokens
-
-# Generic fallback for unrecognised tool types.
+# ── per-result content limits for the RECENT window ──────────────────────────
+# (characters; ~4 chars ≈ 1 token)
+READ_HEAD_CHARS = 2000    # ~500 tok — file structure / imports
+READ_TAIL_CHARS = 4000    # ~1000 tok — active editing region
+EXEC_HEAD_CHARS = 800     # ~200 tok — command + env context
+EXEC_TAIL_CHARS = 4800    # ~1200 tok — errors live at the tail
+TEST_TAIL_CHARS = 10000   # ~2500 tok — failing traceback is always at the tail
+WRITE_MAX_CHARS = 2000    # ~500 tok — ack messages are usually small
 GENERIC_HEAD_CHARS = 1000
 GENERIC_TAIL_CHARS = 4000
-
-# Minimum content length before truncation is applied (avoid truncating tiny results).
-MIN_CHARS_TO_TRUNCATE = 500
+MIN_CHARS_TO_TRUNCATE = 500  # below this, truncation has no effect worth paying for
 
 # ── state persistence ─────────────────────────────────────────────────────────
 STATE_VERSION = 1
 STATE_DIR_NAME = "state"
 
-# ── truncation marker ─────────────────────────────────────────────────────────
+# ── markers ───────────────────────────────────────────────────────────────────
 _OMIT_MIDDLE = "\n[...{count} chars omitted...]\n"
 _OMIT_HEAD   = "[...{count} chars omitted from start...]\n"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Low-level helpers (unchanged from baseline)
+# Low-level helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
 def normalize_role(value: Any) -> str:
@@ -340,69 +340,8 @@ def sanitize_messages(messages: list[Any]) -> tuple[list[Any], dict[str, Any]]:
     }
 
 
-def find_first_user_index(messages: list[Any]) -> Optional[int]:
-    for index, message in enumerate(messages):
-        if isinstance(message, dict) and normalize_role(message.get("role")) == "user":
-            return index
-    return None
-
-
-def find_tool_call_indices(messages: list[Any], tool_result_indices: list[int]) -> list[int]:
-    wanted_ids: set[str] = set()
-    for index in tool_result_indices:
-        wanted_ids.update(extract_tool_result_ids(messages[index]))
-
-    matched: list[int] = []
-    if wanted_ids:
-        for index, message in enumerate(messages):
-            if extract_tool_call_ids(message) & wanted_ids:
-                matched.append(index)
-
-    if matched:
-        return matched
-
-    first_tool_result_index = min(tool_result_indices)
-    for index in range(first_tool_result_index - 1, -1, -1):
-        if extract_tool_call_ids(messages[index]):
-            return [index]
-
-    return []
-
-
-def filter_tool_call_message(message: Any, wanted_ids: set[str]) -> Any:
-    if not isinstance(message, dict) or not wanted_ids:
-        return message
-
-    filtered = copy.deepcopy(message)
-    content = filtered.get("content")
-    if isinstance(content, list):
-        filtered["content"] = [
-            block for block in content
-            if not (
-                isinstance(block, dict)
-                and block.get("type") == "toolCall"
-                and isinstance(block.get("id"), str)
-                and block["id"].strip() not in wanted_ids
-            )
-        ]
-
-    for field in ("toolCalls", "tool_calls"):
-        tool_calls = filtered.get(field)
-        if isinstance(tool_calls, list):
-            filtered[field] = [
-                tool_call for tool_call in tool_calls
-                if not (
-                    isinstance(tool_call, dict)
-                    and isinstance(tool_call.get("id"), str)
-                    and tool_call["id"].strip() not in wanted_ids
-                )
-            ]
-
-    return filtered
-
-
 # ─────────────────────────────────────────────────────────────────────────────
-# Tool call index  (new)
+# Tool call index
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_tool_call_index(messages: list[Any]) -> dict[str, dict[str, Any]]:
@@ -460,31 +399,26 @@ def get_tool_info_for_result(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Tool-type classification  (new)
+# Tool-type classification
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Names that indicate a file-read operation.
 _READ_TOOL_NAMES = frozenset({
     "read", "read_file", "view", "view_file", "cat", "open",
     "get_file_content", "file_read", "show_file",
 })
-
-# Names that indicate a file-write / edit / patch operation.
 _WRITE_TOOL_NAMES = frozenset({
     "write", "write_file", "edit", "edit_file", "str_replace",
     "str_replace_editor", "create_file", "replace", "patch",
     "apply_patch", "insert", "delete", "update_file",
 })
-
-# Shell-execution names.
 _EXEC_TOOL_NAMES = frozenset({
     "exec", "bash", "shell", "run", "run_command", "execute",
     "terminal", "cmd", "command",
 })
-
-# Keywords that identify a test run inside a shell command.
-_TEST_KEYWORDS = ("pytest", "python -m pytest", "python -m test", "unittest",
-                  "nose2", "tox", "python test", "py.test")
+_TEST_KEYWORDS = (
+    "pytest", "python -m pytest", "python -m test", "unittest",
+    "nose2", "tox", "python test", "py.test",
+)
 
 
 def classify_tool_type(tool_name: str, tool_input: dict) -> str:
@@ -499,7 +433,6 @@ def classify_tool_type(tool_name: str, tool_input: dict) -> str:
         if any(kw in command for kw in _TEST_KEYWORDS):
             return "test"
         return "exec"
-    # Heuristic fallback: if input has a "path" key it's likely a read.
     if "path" in tool_input and not any(k in tool_input for k in ("content", "new_str", "old_str", "insert")):
         return "read"
     return "other"
@@ -515,29 +448,24 @@ def extract_file_path_from_tool(tool_name: str, tool_input: dict) -> str | None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Content truncation helpers  (new)
+# Content truncation helpers (applied to RECENT window only)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _truncate_head_tail(text: str, head: int, tail: int) -> str:
-    """Keep the first `head` and last `tail` characters, with an omission marker."""
     if len(text) <= head + tail:
         return text
     omitted = len(text) - head - tail
-    marker = _OMIT_MIDDLE.format(count=omitted)
-    return text[:head] + marker + text[-tail:]
+    return text[:head] + _OMIT_MIDDLE.format(count=omitted) + text[-tail:]
 
 
 def _truncate_tail_only(text: str, max_chars: int) -> str:
-    """Keep only the last `max_chars` characters (errors live at the end)."""
     if len(text) <= max_chars:
         return text
     omitted = len(text) - max_chars
-    marker = _OMIT_HEAD.format(count=omitted)
-    return marker + text[-max_chars:]
+    return _OMIT_HEAD.format(count=omitted) + text[-max_chars:]
 
 
 def _compress_text_by_type(text: str, tool_type: str) -> str:
-    """Apply type-specific truncation to a raw text string."""
     if len(text) <= MIN_CHARS_TO_TRUNCATE:
         return text
     if tool_type == "read":
@@ -548,15 +476,13 @@ def _compress_text_by_type(text: str, tool_type: str) -> str:
         return _truncate_head_tail(text, EXEC_HEAD_CHARS, EXEC_TAIL_CHARS)
     if tool_type == "write":
         if len(text) > WRITE_MAX_CHARS:
-            omitted = len(text) - WRITE_MAX_CHARS
-            return text[:WRITE_MAX_CHARS] + f"\n[...{omitted} chars omitted...]"
+            return text[:WRITE_MAX_CHARS] + f"\n[...{len(text) - WRITE_MAX_CHARS} chars omitted...]"
         return text
-    # Generic fallback.
     return _truncate_head_tail(text, GENERIC_HEAD_CHARS, GENERIC_TAIL_CHARS)
 
 
 def _compress_content(content: Any, tool_type: str) -> tuple[Any, bool]:
-    """Recursively compress content, returning (new_content, changed)."""
+    """Recursively compress content; returns (new_content, changed)."""
     if isinstance(content, str):
         compressed = _compress_text_by_type(content, tool_type)
         return compressed, compressed != content
@@ -567,7 +493,6 @@ def _compress_content(content: Any, tool_type: str) -> tuple[Any, bool]:
         for block in content:
             if isinstance(block, dict):
                 block_type = block.get("type", "")
-                # Text blocks inside tool results.
                 if block_type in ("text", "tool_result", ""):
                     text = block.get("text")
                     if isinstance(text, str):
@@ -578,7 +503,6 @@ def _compress_content(content: Any, tool_type: str) -> tuple[Any, bool]:
                             new_blocks.append(new_block)
                             changed = True
                             continue
-                    # Recurse into nested content.
                     nested = block.get("content")
                     if nested is not None:
                         new_nested, nested_changed = _compress_content(nested, tool_type)
@@ -594,18 +518,15 @@ def _compress_content(content: Any, tool_type: str) -> tuple[Any, bool]:
     return content, False
 
 
-def compress_tool_result_message(
+def _compress_recent_tool_result(
     message: Any,
     tool_call_index: dict[str, dict[str, Any]],
 ) -> tuple[Any, bool]:
-    """Return a (possibly content-truncated) copy of a toolResult message."""
+    """Apply content-aware truncation to a RECENT toolResult (within window)."""
     if not isinstance(message, dict):
         return message, False
     tool_info = get_tool_info_for_result(message, tool_call_index)
-    tool_name = tool_info.get("name", "")
-    tool_input = tool_info.get("input", {})
-    tool_type = classify_tool_type(tool_name, tool_input)
-
+    tool_type = classify_tool_type(tool_info.get("name", ""), tool_info.get("input", {}))
     content = message.get("content")
     new_content, changed = _compress_content(content, tool_type)
     if not changed:
@@ -615,152 +536,168 @@ def compress_tool_result_message(
     return new_msg, True
 
 
-def compress_all_tool_results(
+# ─────────────────────────────────────────────────────────────────────────────
+# Tombstone markers (applied to OLD observations outside the window)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _make_tombstone(
+    message: Any,
+    tool_call_index: dict[str, dict[str, Any]],
+) -> str:
+    """
+    Compact marker replacing an old observation's content.
+
+    Preserves the "what I already tried" signal so the agent doesn't re-explore.
+    Format: "[observation masked: {type} {path_or_cmd}]"
+    Examples:
+      "[observation masked: read src/utils.py]"
+      "[observation masked: test pytest tests/]"
+      "[observation masked: exec git diff HEAD]"
+      "[observation masked: write tests/test_utils.py]"
+    """
+    tool_info = get_tool_info_for_result(message, tool_call_index)
+    tool_name = tool_info.get("name", "")
+    tool_input = tool_info.get("input", {})
+    tool_type = classify_tool_type(tool_name, tool_input) if tool_name else "unknown"
+
+    if tool_type == "read":
+        path = extract_file_path_from_tool(tool_name, tool_input) or ""
+        return f"[observation masked: read {path}]" if path else "[observation masked: read]"
+
+    if tool_type in ("test", "exec"):
+        cmd = str(tool_input.get("command", tool_input.get("cmd", "")))[:50].strip()
+        return f"[observation masked: {tool_type} {cmd}]" if cmd else f"[observation masked: {tool_type}]"
+
+    if tool_type == "write":
+        path = extract_file_path_from_tool(tool_name, tool_input) or ""
+        return f"[observation masked: write {path}]" if path else "[observation masked: write]"
+
+    return f"[observation masked: {tool_type}]"
+
+
+def _replace_content_with_tombstone(
+    message: Any,
+    tombstone: str,
+) -> Any:
+    """Replace a toolResult's content with a tombstone string."""
+    if not isinstance(message, dict):
+        return message
+    current_content = message.get("content")
+    if current_content == tombstone:
+        return message  # already tombstoned; skip deepcopy
+    new_msg = dict(message)
+    new_msg["content"] = tombstone
+    return new_msg
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Core: observation masking (primary algorithm)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def apply_observation_masking(
     messages: list[Any],
     tool_call_index: dict[str, dict[str, Any]],
+    window: int = OBSERVATION_MASK_WINDOW,
 ) -> tuple[list[Any], dict[str, Any]]:
-    """Apply content-aware truncation to every toolResult in the list."""
+    """
+    Pure observation masking (Lindenbauer et al. NeurIPS 2025, M=10 for Qwen3-Coder).
+
+    For each toolResult message:
+    - If it is within the last `window` tool results: apply content-aware truncation.
+    - Otherwise: replace content with a compact tombstone marker.
+
+    ALL message pairs are preserved (no structural dropping).
+    The full reasoning trace in assistant messages is always kept intact —
+    this is what prevents the agent from re-exploring (flail).
+    """
+    # Collect all toolResult positions.
+    tool_result_indices: list[int] = [
+        i for i, m in enumerate(messages)
+        if isinstance(m, dict) and normalize_role(m.get("role")) == "toolResult"
+    ]
+
+    total = len(tool_result_indices)
+    if total == 0:
+        return messages, {
+            "changed": False, "tombstonedCount": 0, "compressedCount": 0,
+            "charsSaved": 0, "totalToolResults": 0, "windowSize": window,
+        }
+
+    boundary = max(0, total - window)
+    tombstone_set = set(tool_result_indices[:boundary])
+    recent_set    = set(tool_result_indices[boundary:])
+
     result = list(messages)
+    changed = False
+    tombstoned_count = 0
     compressed_count = 0
     chars_saved = 0
 
     for i, msg in enumerate(messages):
         if not isinstance(msg, dict) or normalize_role(msg.get("role")) != "toolResult":
             continue
-        original_len = len(extract_text(msg.get("content")))
-        new_msg, changed = compress_tool_result_message(msg, tool_call_index)
-        if changed:
-            result[i] = new_msg
-            compressed_count += 1
-            chars_saved += original_len - len(extract_text(new_msg.get("content")))
 
-    any_changed = compressed_count > 0
-    return (result if any_changed else messages), {
-        "changed": any_changed,
+        original_len = len(extract_text(msg.get("content")))
+
+        if i in tombstone_set:
+            tombstone = _make_tombstone(msg, tool_call_index)
+            new_msg = _replace_content_with_tombstone(msg, tombstone)
+            if new_msg is not msg:
+                result[i] = new_msg
+                changed = True
+                tombstoned_count += 1
+                chars_saved += max(0, original_len - len(tombstone))
+
+        elif i in recent_set:
+            new_msg, was_compressed = _compress_recent_tool_result(msg, tool_call_index)
+            if was_compressed:
+                result[i] = new_msg
+                changed = True
+                compressed_count += 1
+                new_len = len(extract_text(new_msg.get("content")))
+                chars_saved += max(0, original_len - new_len)
+
+    return (result if changed else messages), {
+        "changed": changed,
+        "tombstonedCount": tombstoned_count,
         "compressedCount": compressed_count,
         "charsSaved": chars_saved,
+        "totalToolResults": total,
+        "windowSize": window,
     }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Smart tool-result selection  (new)
+# Re-exploration (flail) detection — informational only, does not change output
 # ─────────────────────────────────────────────────────────────────────────────
 
-def select_tool_results_smart(
-    all_result_indices: list[int],
+def detect_reread_loop(
     messages: list[Any],
     tool_call_index: dict[str, dict[str, Any]],
-    keep_count: int,
-) -> list[int]:
+    look_back: int = 8,
+    threshold: int = 3,
+) -> dict[str, Any]:
     """
-    Select which `keep_count` tool result indices to keep, using these rules:
+    Detect if the agent is in a re-read loop (same file path appears >= threshold
+    times among the last `look_back` tool results).
 
-    1. Deduplicate reads: for the same file path, keep only the most-recent
-       read result (earlier reads of that file are superseded).
-    2. Prioritise test-run outputs — they carry failing-traceback signal.
-    3. Fill remaining slots with the most-recent results.
-
-    Chronological ordering is preserved in the returned list.
+    Returns diagnostic info; does not modify the trajectory.
     """
-    if len(all_result_indices) <= keep_count:
-        return all_result_indices
-
-    # Build per-index metadata.
-    meta: list[dict[str, Any]] = []
-    for idx in all_result_indices:
-        msg = messages[idx]
-        tool_info = get_tool_info_for_result(msg, tool_call_index)
-        tool_name = tool_info.get("name", "")
-        tool_input = tool_info.get("input", {})
-        tool_type = classify_tool_type(tool_name, tool_input)
-        file_path = (
-            extract_file_path_from_tool(tool_name, tool_input)
-            if tool_type == "read" else None
-        )
-        meta.append({"idx": idx, "type": tool_type, "file_path": file_path})
-
-    # Deduplicate reads: scan newest-first, keep only first occurrence per path.
-    seen_paths: set[str] = set()
-    deduped: list[dict[str, Any]] = []
-    for m in reversed(meta):
-        if m["type"] == "read" and m["file_path"]:
-            if m["file_path"] in seen_paths:
-                continue  # stale read – superseded by a later read
-            seen_paths.add(m["file_path"])
-        deduped.append(m)
-    deduped.reverse()  # restore chronological order
-
-    if len(deduped) <= keep_count:
-        return [m["idx"] for m in deduped]
-
-    # Among the deduplicated set, prefer to keep test outputs.
-    test_indices = [m["idx"] for m in deduped if m["type"] == "test"]
-    non_test = [m["idx"] for m in deduped if m["type"] != "test"]
-
-    # Always keep up to 2 most-recent test outputs.
-    kept_tests = test_indices[-2:] if len(test_indices) > 2 else test_indices
-    remaining_slots = keep_count - len(kept_tests)
-    kept_non_test = non_test[-remaining_slots:] if remaining_slots > 0 else []
-
-    # Merge and sort by original index to restore chronological order.
-    selected = sorted(set(kept_tests) | set(kept_non_test))
-    return selected
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Structural pruning  (enhanced)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def prune_messages(
-    messages: list[Any],
-    tool_call_index: Optional[dict[str, dict[str, Any]]] = None,
-) -> tuple[list[Any], dict[str, Any]]:
-    first_user_index = find_first_user_index(messages)
-    if first_user_index is None:
-        return messages, {"changed": False, "reason": "missing_first_user_message"}
-
     tool_result_indices = [
-        index for index, message in enumerate(messages)
-        if isinstance(message, dict) and normalize_role(message.get("role")) == "toolResult"
+        i for i, m in enumerate(messages)
+        if isinstance(m, dict) and normalize_role(m.get("role")) == "toolResult"
     ]
-    if len(tool_result_indices) < KEEP_TOOL_RESULT_COUNT:
-        return messages, {
-            "changed": False,
-            "reason": "fewer_than_threshold_tool_results",
-            "toolResultCount": len(tool_result_indices),
-        }
-
-    # Smart selection (dedup + priority) when index is available.
-    if tool_call_index is not None:
-        kept_tool_result_indices = select_tool_results_smart(
-            tool_result_indices, messages, tool_call_index, KEEP_TOOL_RESULT_COUNT
-        )
-    else:
-        kept_tool_result_indices = tool_result_indices[-KEEP_TOOL_RESULT_COUNT:]
-
-    kept_tool_result_ids: set[str] = set()
-    for index in kept_tool_result_indices:
-        kept_tool_result_ids.update(extract_tool_result_ids(messages[index]))
-
-    tool_call_indices = find_tool_call_indices(messages, kept_tool_result_indices)
-    if not tool_call_indices:
-        return messages, {"changed": False, "reason": "missing_invoking_tool_call"}
-
-    keep_indices = {first_user_index, *kept_tool_result_indices, *tool_call_indices}
-    pruned = [
-        filter_tool_call_message(message, kept_tool_result_ids) if index in tool_call_indices else message
-        for index, message in enumerate(messages)
-        if index in keep_indices
-    ]
-    changed = len(pruned) != len(messages)
-    return pruned if changed else messages, {
-        "changed": changed,
-        "reason": "pruned" if changed else "nothing_to_remove",
-        "originalMessageCount": len(messages),
-        "messageCount": len(pruned) if changed else len(messages),
-        "keptToolResultCount": KEEP_TOOL_RESULT_COUNT,
-        "keptToolCallMessageCount": len(tool_call_indices),
-    }
+    recent = tool_result_indices[-look_back:]
+    path_counts: dict[str, int] = {}
+    for idx in recent:
+        info = get_tool_info_for_result(messages[idx], tool_call_index)
+        t = classify_tool_type(info.get("name", ""), info.get("input", {}))
+        if t == "read":
+            path = extract_file_path_from_tool(info.get("name", ""), info.get("input", {}))
+            if path:
+                path_counts[path] = path_counts.get(path, 0) + 1
+    looping_files = {p: c for p, c in path_counts.items() if c >= threshold}
+    return {"loop": bool(looping_files), "loopingFiles": looping_files}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -778,49 +715,46 @@ def handle_assemble(payload: dict[str, Any]) -> dict[str, Any]:
     working_messages, state_metadata, state_path = resolve_stateful_messages(payload, messages)
     runtime_messages, sanitization = sanitize_messages(working_messages)
 
-    # Build tool-call index before any compression/pruning.
+    # Build tool-call index (needed for tombstone labels and content compression).
     tool_call_index = build_tool_call_index(runtime_messages)
 
-    # Content-aware truncation of every toolResult (in-place, no structural changes).
-    content_compressed, compression_meta = compress_all_tool_results(runtime_messages, tool_call_index)
+    # Apply observation masking: tombstone old observations, truncate recent ones.
+    masked_messages, masking_meta = apply_observation_masking(runtime_messages, tool_call_index)
 
-    # Structural pruning with smart tool-result selection.
-    pruned_messages, prune_meta = prune_messages(content_compressed, tool_call_index)
+    # Informational flail detection (does not alter output).
+    loop_info = detect_reread_loop(runtime_messages, tool_call_index)
 
-    pruned   = bool(prune_meta.get("changed"))
     sanitized = bool(sanitization.get("changed"))
-    content_changed = bool(compression_meta.get("changed"))
-    output_differs_from_raw = fingerprint_messages(pruned_messages) != fingerprint_messages(messages)
-    changed = pruned or sanitized or content_changed or output_differs_from_raw
+    masked    = bool(masking_meta.get("changed"))
+    output_differs_from_raw = fingerprint_messages(masked_messages) != fingerprint_messages(messages)
+    changed = sanitized or masked or output_differs_from_raw
 
-    reason = prune_meta.get("reason")
-    if pruned:
-        reason = "pruned"
-    elif content_changed:
-        reason = "content_compressed"
+    if masked:
+        reason = "observation_masked"
     elif sanitized:
         reason = "sanitized"
     elif output_differs_from_raw and state_metadata.get("stateLoaded"):
         reason = "state_reused"
+    else:
+        reason = "unchanged"
 
     metadata = {
-        **prune_meta,
+        **masking_meta,
         **state_metadata,
         "changed": changed,
         "reason": reason,
         "originalMessageCount": len(messages),
-        "messageCount": len(pruned_messages),
+        "messageCount": len(masked_messages),
         "sanitized": sanitized,
         "removedMessageCount": sanitization.get("removedMessageCount", 0),
         "removedThinkingBlockCount": sanitization.get("removedThinkingBlockCount", 0),
-        "pruned": pruned,
-        "contentCompressed": content_changed,
-        "compressedToolResultCount": compression_meta.get("compressedCount", 0),
-        "charsSaved": compression_meta.get("charsSaved", 0),
+        "pruned": False,
+        "observationMasked": masked,
+        "rereadLoop": loop_info,
     }
 
     try:
-        save_state(state_path, payload, messages, pruned_messages)
+        save_state(state_path, payload, messages, masked_messages)
         metadata["stateSaved"] = True
     except Exception as error:
         metadata["stateSaved"] = False
@@ -828,8 +762,8 @@ def handle_assemble(payload: dict[str, Any]) -> dict[str, Any]:
 
     return {
         "assembled": True,
-        "messages": pruned_messages,
-        "estimatedTokens": estimate_tokens_for_message_array(pruned_messages),
+        "messages": masked_messages,
+        "estimatedTokens": estimate_tokens_for_message_array(masked_messages),
         "baseMiner": metadata,
     }
 
