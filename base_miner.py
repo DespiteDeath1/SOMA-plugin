@@ -35,7 +35,29 @@ EVENT_NAMES = frozenset({"assemble"})
 # Last N tool results keep their content (content-truncated).
 # All older tool results get a compact tombstone.
 # Empirically optimal at M=10 for Qwen3-Coder 480B (Lindenbauer et al. 2025).
-OBSERVATION_MASK_WINDOW = 10
+OBSERVATION_MASK_WINDOW = 10   # default / standard trajectories
+
+# Adaptive windows by trajectory regime (computed from struggle signals):
+WINDOW_SHORT    = 999  # sentinel: short trajectory -> no tombstoning at all
+WINDOW_HARD     = 7    # moderate struggling  (20-30 tool results, 1-2 signals)
+WINDOW_DROWNING = 5    # heavy struggling     (30+ tool results, 3+ signals)
+
+# Screener-safety boundary: trajectories with <= this many tool results get
+# WINDOW_SHORT (no tombstoning). Easy screener tasks: 5-12 results.
+# Hard competition tasks: typically 20-60. This guarantees the screener is
+# never broken regardless of how aggressive the Hard tuning is.
+SCREENER_SAFE_LENGTH = 14
+
+# Struggling-signal thresholds (empirically grounded):
+#   Successful SWE-bench sessions: median 11-16 turns (Liu et al. 2025)
+#   Failed sessions: median 31+ turns (Liu et al. 2025, long-tail failure)
+#   LOOP regime: P(failure|LOOP) = 88.7% (CAUM study, 80K SWE-agent sessions)
+LONG_TRAJ_THRESHOLD  = 20   # >= this many tool results -> at least one signal
+VERY_LONG_THRESHOLD  = 30   # >= this -> heavy compression
+LOOP_LOOKBACK        = 8    # last N results to scan for re-read loops
+LOOP_FILE_REPEAT     = 3    # same file read >= this many times in lookback = loop
+TEST_FAIL_THRESHOLD  = 3    # >= this many failed test runs = agent is stuck
+EDIT_DELAY_THRESHOLD = 14   # no edit after this many results = exploration stall
 
 # ── per-result content limits for the RECENT window ──────────────────────────
 # (characters; ~4 chars ≈ 1 token)
@@ -591,6 +613,139 @@ def _replace_content_with_tombstone(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Trajectory difficulty detection (no-LLM, O(n))
+# ─────────────────────────────────────────────────────────────────────────────
+
+def count_struggling_signals(
+    tool_result_indices: list[int],
+    messages: list[Any],
+    tool_call_index: dict[str, dict[str, Any]],
+) -> tuple[int, dict[str, Any]]:
+    """
+    Count how many struggling signals are present in the trajectory (0-4).
+
+    Each signal corresponds to a known Hard-task failure mode:
+    1. LONG_TRAJ  : >= LONG_TRAJ_THRESHOLD tool results (failed sessions run
+                    2x longer than successful ones; Liu et al. 2025)
+    2. LOOP       : same file read >= LOOP_FILE_REPEAT times in last
+                    LOOP_LOOKBACK results (LOOP regime; CAUM, P(fail)=88.7%)
+    3. TEST_FAILS : >= TEST_FAIL_THRESHOLD failed test runs (agent is stuck
+                    cycling through the same broken fix attempts)
+    4. NO_EDIT    : no edit/write among first EDIT_DELAY_THRESHOLD results
+                    (pure exploration phase — agent can't commit to a fix)
+
+    Returns (signal_count, detail_dict).
+    """
+    n = len(tool_result_indices)
+    signals = 0
+    detail: dict[str, Any] = {}
+
+    # Signal 1: long trajectory
+    if n >= LONG_TRAJ_THRESHOLD:
+        signals += 1
+        detail["longTraj"] = n
+
+    # Signal 2: re-read loop in recent window
+    recent = tool_result_indices[-LOOP_LOOKBACK:]
+    path_counts: dict[str, int] = {}
+    for idx in recent:
+        info = get_tool_info_for_result(messages[idx], tool_call_index)
+        t = classify_tool_type(info.get("name", ""), info.get("input", {}))
+        if t == "read":
+            p = extract_file_path_from_tool(info.get("name", ""), info.get("input", {}))
+            if p:
+                path_counts[p] = path_counts.get(p, 0) + 1
+    looping = {p: c for p, c in path_counts.items() if c >= LOOP_FILE_REPEAT}
+    if looping:
+        signals += 1
+        detail["loop"] = looping
+
+    # Signal 3: multiple failed test runs
+    fail_count = 0
+    for idx in tool_result_indices:
+        info = get_tool_info_for_result(messages[idx], tool_call_index)
+        t = classify_tool_type(info.get("name", ""), info.get("input", {}))
+        if t == "test":
+            text = extract_text(messages[idx].get("content"))
+            if any(kw in text for kw in ("FAILED", "ERROR", "AssertionError", "assert", "FAIL")):
+                fail_count += 1
+    if fail_count >= TEST_FAIL_THRESHOLD:
+        signals += 1
+        detail["testFails"] = fail_count
+
+    # Signal 4: no edit/write in first EDIT_DELAY_THRESHOLD results (pure exploration stall)
+    if n >= EDIT_DELAY_THRESHOLD:
+        early_types = [
+            classify_tool_type(
+                get_tool_info_for_result(messages[tool_result_indices[i]], tool_call_index).get("name", ""),
+                get_tool_info_for_result(messages[tool_result_indices[i]], tool_call_index).get("input", {}),
+            )
+            for i in range(min(EDIT_DELAY_THRESHOLD, n))
+        ]
+        if not any(t == "write" for t in early_types):
+            signals += 1
+            detail["noEarlyEdit"] = True
+
+    return signals, detail
+
+
+def get_adaptive_window(
+    tool_result_count: int,
+    signal_count: int,
+) -> int:
+    """
+    Map trajectory length and struggling signals to an observation-masking window size.
+
+    Screener-safe guarantee: trajectories with <= SCREENER_SAFE_LENGTH tool
+    results ALWAYS get WINDOW_SHORT (no tombstoning), protecting Easy tasks.
+
+    Hard-task compression ladder:
+      0-1 signals, 20-30 results -> WINDOW_HARD (7)
+      2+ signals or 30+ results  -> WINDOW_DROWNING (5)
+    """
+    # Short trajectory (Easy / screener tasks): never tombstone
+    if tool_result_count <= SCREENER_SAFE_LENGTH:
+        return WINDOW_SHORT
+
+    # Standard trajectory (not yet struggling)
+    if signal_count == 0:
+        return OBSERVATION_MASK_WINDOW  # 10
+
+    # Hard trajectory — use compression ladder
+    if tool_result_count >= VERY_LONG_THRESHOLD or signal_count >= 2:
+        return WINDOW_DROWNING  # 5
+    return WINDOW_HARD  # 7
+
+
+def collect_always_keep_indices(
+    tool_result_indices: list[int],
+    messages: list[Any],
+    tool_call_index: dict[str, dict[str, Any]],
+    n_test: int = 1,
+    n_edit: int = 2,
+) -> set[int]:
+    """
+    Collect tool result indices that must ALWAYS be in the full-content window,
+    regardless of the adaptive window boundary.
+
+    Always keep:
+    - Last n_test TEST results: the failing traceback is the fix signal.
+    - Last n_edit WRITE/EDIT results: the agent must see what it already changed.
+    """
+    test_indices: list[int] = []
+    edit_indices: list[int] = []
+    for idx in tool_result_indices:
+        info = get_tool_info_for_result(messages[idx], tool_call_index)
+        t = classify_tool_type(info.get("name", ""), info.get("input", {}))
+        if t == "test":
+            test_indices.append(idx)
+        elif t == "write":
+            edit_indices.append(idx)
+    return set(test_indices[-n_test:]) | set(edit_indices[-n_edit:])
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Core: observation masking (primary algorithm)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -598,17 +753,22 @@ def apply_observation_masking(
     messages: list[Any],
     tool_call_index: dict[str, dict[str, Any]],
     window: int = OBSERVATION_MASK_WINDOW,
+    always_keep: Optional[set[int]] = None,
 ) -> tuple[list[Any], dict[str, Any]]:
     """
-    Pure observation masking (Lindenbauer et al. NeurIPS 2025, M=10 for Qwen3-Coder).
+    Adaptive observation masking.
 
     For each toolResult message:
-    - If it is within the last `window` tool results: apply content-aware truncation.
+    - If it is within the last `window` tool results, OR in `always_keep`:
+      apply content-aware truncation (full content, head+tail clipped).
     - Otherwise: replace content with a compact tombstone marker.
 
+    `always_keep`: set of message indices that must always be in the full-content
+    window regardless of `window`.  Used to guarantee the most recent test result
+    and recent edit results are always visible (critical for Hard tasks).
+
     ALL message pairs are preserved (no structural dropping).
-    The full reasoning trace in assistant messages is always kept intact —
-    this is what prevents the agent from re-exploring (flail).
+    The full reasoning trace in assistant messages is always kept intact.
     """
     # Collect all toolResult positions.
     tool_result_indices: list[int] = [
@@ -623,9 +783,16 @@ def apply_observation_masking(
             "charsSaved": 0, "totalToolResults": 0, "windowSize": window,
         }
 
-    boundary = max(0, total - window)
-    tombstone_set = set(tool_result_indices[:boundary])
-    recent_set    = set(tool_result_indices[boundary:])
+    # Apply adaptive window (999 = sentinel for "no tombstoning")
+    effective_window = min(window, total)
+    boundary = max(0, total - effective_window)
+    base_tombstone = set(tool_result_indices[:boundary])
+    base_recent    = set(tool_result_indices[boundary:])
+
+    # Override: always-keep indices are moved from tombstone_set to recent_set
+    forced_recent = (always_keep or set()) & base_tombstone
+    tombstone_set = base_tombstone - forced_recent
+    recent_set    = base_recent | forced_recent
 
     result = list(messages)
     changed = False
@@ -718,8 +885,23 @@ def handle_assemble(payload: dict[str, Any]) -> dict[str, Any]:
     # Build tool-call index (needed for tombstone labels and content compression).
     tool_call_index = build_tool_call_index(runtime_messages)
 
+    # Collect all toolResult indices (needed for struggle detection and masking).
+    tr_indices: list[int] = [
+        i for i, m in enumerate(runtime_messages)
+        if isinstance(m, dict) and normalize_role(m.get("role")) == "toolResult"
+    ]
+
+    # Determine adaptive window size from trajectory struggle signals.
+    signal_count, signal_detail = count_struggling_signals(tr_indices, runtime_messages, tool_call_index)
+    adaptive_window = get_adaptive_window(len(tr_indices), signal_count)
+
+    # Identify always-keep indices (most recent test + recent edits).
+    always_keep = collect_always_keep_indices(tr_indices, runtime_messages, tool_call_index)
+
     # Apply observation masking: tombstone old observations, truncate recent ones.
-    masked_messages, masking_meta = apply_observation_masking(runtime_messages, tool_call_index)
+    masked_messages, masking_meta = apply_observation_masking(
+        runtime_messages, tool_call_index, window=adaptive_window, always_keep=always_keep
+    )
 
     # Informational flail detection (does not alter output).
     loop_info = detect_reread_loop(runtime_messages, tool_call_index)
@@ -751,6 +933,9 @@ def handle_assemble(payload: dict[str, Any]) -> dict[str, Any]:
         "pruned": False,
         "observationMasked": masked,
         "rereadLoop": loop_info,
+        "adaptiveWindow": adaptive_window,
+        "struggleSignals": signal_count,
+        "struggleDetail": signal_detail,
     }
 
     try:
