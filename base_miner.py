@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Minimal SOMA miner baseline for assemble-time trajectory pruning."""
+"""SOMA miner for assemble-time trajectory pruning.
+
+Algorithmic (no-LLM) context compressor for OpenClaw/qwen3-coder SWE-bench agents.
+Key strategy: content-aware truncation + stale-read deduplication + smart result
+selection keeps the agent focused without losing solve-critical signals.
+"""
 
 from __future__ import annotations
 
@@ -14,10 +19,48 @@ from typing import Any, Optional
 
 
 EVENT_NAMES = frozenset({"assemble"})
-KEEP_TOOL_RESULT_COUNT = 4
+
+# ── structural window ─────────────────────────────────────────────────────────
+# How many tool results to keep in the final compressed trajectory.
+# Raised from 4 → 6 so the agent keeps a broader recent horizon; content
+# truncation (below) compensates for the extra messages.
+KEEP_TOOL_RESULT_COUNT = 6
+
+# ── per-result content limits (characters; ~4 chars ≈ 1 token) ───────────────
+# File-read results: keep structure (imports / class defs) from the head,
+# and the active editing region from the tail.
+READ_HEAD_CHARS = 2000   # ~500 tokens
+READ_TAIL_CHARS = 4000   # ~1000 tokens  (most-recent code is load-bearing)
+
+# Shell / exec results: environment line from head, errors/output from tail.
+EXEC_HEAD_CHARS = 800    # ~200 tokens
+EXEC_TAIL_CHARS = 4800   # ~1200 tokens  (errors live at the end)
+
+# Test-run results: critical – failing traceback is always at the tail.
+TEST_TAIL_CHARS = 10000  # ~2500 tokens  (keep full failure output)
+
+# Write / edit / patch results: usually small acknowledgements.
+WRITE_MAX_CHARS = 2000   # ~500 tokens
+
+# Generic fallback for unrecognised tool types.
+GENERIC_HEAD_CHARS = 1000
+GENERIC_TAIL_CHARS = 4000
+
+# Minimum content length before truncation is applied (avoid truncating tiny results).
+MIN_CHARS_TO_TRUNCATE = 500
+
+# ── state persistence ─────────────────────────────────────────────────────────
 STATE_VERSION = 1
 STATE_DIR_NAME = "state"
 
+# ── truncation marker ─────────────────────────────────────────────────────────
+_OMIT_MIDDLE = "\n[...{count} chars omitted...]\n"
+_OMIT_HEAD   = "[...{count} chars omitted from start...]\n"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Low-level helpers (unchanged from baseline)
+# ─────────────────────────────────────────────────────────────────────────────
 
 def normalize_role(value: Any) -> str:
     if not isinstance(value, str):
@@ -119,7 +162,12 @@ def load_state(state_path: Path) -> dict[str, Any] | None:
     return state
 
 
-def save_state(state_path: Path, payload: dict[str, Any], raw_messages: list[Any], current_messages: list[Any]) -> None:
+def save_state(
+    state_path: Path,
+    payload: dict[str, Any],
+    raw_messages: list[Any],
+    current_messages: list[Any],
+) -> None:
     _, session_id, session_key = resolve_session_identity(payload)
     state = {
         "version": STATE_VERSION,
@@ -137,7 +185,10 @@ def save_state(state_path: Path, payload: dict[str, Any], raw_messages: list[Any
     temp_path.replace(state_path)
 
 
-def resolve_stateful_messages(payload: dict[str, Any], raw_messages: list[Any]) -> tuple[list[Any], dict[str, Any], Path]:
+def resolve_stateful_messages(
+    payload: dict[str, Any],
+    raw_messages: list[Any],
+) -> tuple[list[Any], dict[str, Any], Path]:
     state_path = resolve_state_path(payload)
     state = load_state(state_path)
     metadata: dict[str, Any] = {
@@ -350,7 +401,320 @@ def filter_tool_call_message(message: Any, wanted_ids: set[str]) -> Any:
     return filtered
 
 
-def prune_messages(messages: list[Any]) -> tuple[list[Any], dict[str, Any]]:
+# ─────────────────────────────────────────────────────────────────────────────
+# Tool call index  (new)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_tool_call_index(messages: list[Any]) -> dict[str, dict[str, Any]]:
+    """Map every toolCallId found in assistant messages → {name, input}."""
+    index: dict[str, dict[str, Any]] = {}
+    for msg in messages:
+        if not isinstance(msg, dict) or normalize_role(msg.get("role")) != "assistant":
+            continue
+        content = msg.get("content")
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "toolCall":
+                    call_id = block.get("id")
+                    if isinstance(call_id, str) and call_id.strip():
+                        index[call_id.strip()] = {
+                            "name": str(block.get("name", "")),
+                            "input": block.get("input") if isinstance(block.get("input"), dict) else {},
+                        }
+        for field in ("toolCalls", "tool_calls"):
+            tool_calls = msg.get(field)
+            if isinstance(tool_calls, list):
+                for tc in tool_calls:
+                    if not isinstance(tc, dict):
+                        continue
+                    call_id = tc.get("id")
+                    if isinstance(call_id, str) and call_id.strip():
+                        name = tc.get("name") or ""
+                        if not name and isinstance(tc.get("function"), dict):
+                            name = tc["function"].get("name", "")
+                        raw_input = tc.get("input") or tc.get("arguments") or {}
+                        if isinstance(raw_input, str):
+                            try:
+                                raw_input = json.loads(raw_input)
+                            except Exception:
+                                raw_input = {}
+                        index[call_id.strip()] = {
+                            "name": str(name),
+                            "input": raw_input if isinstance(raw_input, dict) else {},
+                        }
+    return index
+
+
+def get_tool_info_for_result(
+    result_msg: Any,
+    index: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """Return {name, input} for a toolResult message, or {} if not found."""
+    if not isinstance(result_msg, dict):
+        return {}
+    for field in ("toolCallId", "toolUseId", "id"):
+        call_id = result_msg.get(field)
+        if isinstance(call_id, str) and call_id.strip() in index:
+            return index[call_id.strip()]
+    return {}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tool-type classification  (new)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Names that indicate a file-read operation.
+_READ_TOOL_NAMES = frozenset({
+    "read", "read_file", "view", "view_file", "cat", "open",
+    "get_file_content", "file_read", "show_file",
+})
+
+# Names that indicate a file-write / edit / patch operation.
+_WRITE_TOOL_NAMES = frozenset({
+    "write", "write_file", "edit", "edit_file", "str_replace",
+    "str_replace_editor", "create_file", "replace", "patch",
+    "apply_patch", "insert", "delete", "update_file",
+})
+
+# Shell-execution names.
+_EXEC_TOOL_NAMES = frozenset({
+    "exec", "bash", "shell", "run", "run_command", "execute",
+    "terminal", "cmd", "command",
+})
+
+# Keywords that identify a test run inside a shell command.
+_TEST_KEYWORDS = ("pytest", "python -m pytest", "python -m test", "unittest",
+                  "nose2", "tox", "python test", "py.test")
+
+
+def classify_tool_type(tool_name: str, tool_input: dict) -> str:
+    """Return one of: 'read', 'write', 'test', 'exec', 'other'."""
+    name_lower = tool_name.lower().strip()
+    if name_lower in _READ_TOOL_NAMES:
+        return "read"
+    if name_lower in _WRITE_TOOL_NAMES:
+        return "write"
+    if name_lower in _EXEC_TOOL_NAMES:
+        command = str(tool_input.get("command", tool_input.get("cmd", ""))).lower()
+        if any(kw in command for kw in _TEST_KEYWORDS):
+            return "test"
+        return "exec"
+    # Heuristic fallback: if input has a "path" key it's likely a read.
+    if "path" in tool_input and not any(k in tool_input for k in ("content", "new_str", "old_str", "insert")):
+        return "read"
+    return "other"
+
+
+def extract_file_path_from_tool(tool_name: str, tool_input: dict) -> str | None:
+    """Return the file path from a read-tool's input, or None."""
+    for field in ("path", "file_path", "filename", "file", "filepath"):
+        value = tool_input.get(field)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Content truncation helpers  (new)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _truncate_head_tail(text: str, head: int, tail: int) -> str:
+    """Keep the first `head` and last `tail` characters, with an omission marker."""
+    if len(text) <= head + tail:
+        return text
+    omitted = len(text) - head - tail
+    marker = _OMIT_MIDDLE.format(count=omitted)
+    return text[:head] + marker + text[-tail:]
+
+
+def _truncate_tail_only(text: str, max_chars: int) -> str:
+    """Keep only the last `max_chars` characters (errors live at the end)."""
+    if len(text) <= max_chars:
+        return text
+    omitted = len(text) - max_chars
+    marker = _OMIT_HEAD.format(count=omitted)
+    return marker + text[-max_chars:]
+
+
+def _compress_text_by_type(text: str, tool_type: str) -> str:
+    """Apply type-specific truncation to a raw text string."""
+    if len(text) <= MIN_CHARS_TO_TRUNCATE:
+        return text
+    if tool_type == "read":
+        return _truncate_head_tail(text, READ_HEAD_CHARS, READ_TAIL_CHARS)
+    if tool_type == "test":
+        return _truncate_tail_only(text, TEST_TAIL_CHARS)
+    if tool_type == "exec":
+        return _truncate_head_tail(text, EXEC_HEAD_CHARS, EXEC_TAIL_CHARS)
+    if tool_type == "write":
+        if len(text) > WRITE_MAX_CHARS:
+            omitted = len(text) - WRITE_MAX_CHARS
+            return text[:WRITE_MAX_CHARS] + f"\n[...{omitted} chars omitted...]"
+        return text
+    # Generic fallback.
+    return _truncate_head_tail(text, GENERIC_HEAD_CHARS, GENERIC_TAIL_CHARS)
+
+
+def _compress_content(content: Any, tool_type: str) -> tuple[Any, bool]:
+    """Recursively compress content, returning (new_content, changed)."""
+    if isinstance(content, str):
+        compressed = _compress_text_by_type(content, tool_type)
+        return compressed, compressed != content
+
+    if isinstance(content, list):
+        new_blocks: list[Any] = []
+        changed = False
+        for block in content:
+            if isinstance(block, dict):
+                block_type = block.get("type", "")
+                # Text blocks inside tool results.
+                if block_type in ("text", "tool_result", ""):
+                    text = block.get("text")
+                    if isinstance(text, str):
+                        compressed = _compress_text_by_type(text, tool_type)
+                        if compressed != text:
+                            new_block = dict(block)
+                            new_block["text"] = compressed
+                            new_blocks.append(new_block)
+                            changed = True
+                            continue
+                    # Recurse into nested content.
+                    nested = block.get("content")
+                    if nested is not None:
+                        new_nested, nested_changed = _compress_content(nested, tool_type)
+                        if nested_changed:
+                            new_block = dict(block)
+                            new_block["content"] = new_nested
+                            new_blocks.append(new_block)
+                            changed = True
+                            continue
+            new_blocks.append(block)
+        return (new_blocks if changed else content), changed
+
+    return content, False
+
+
+def compress_tool_result_message(
+    message: Any,
+    tool_call_index: dict[str, dict[str, Any]],
+) -> tuple[Any, bool]:
+    """Return a (possibly content-truncated) copy of a toolResult message."""
+    if not isinstance(message, dict):
+        return message, False
+    tool_info = get_tool_info_for_result(message, tool_call_index)
+    tool_name = tool_info.get("name", "")
+    tool_input = tool_info.get("input", {})
+    tool_type = classify_tool_type(tool_name, tool_input)
+
+    content = message.get("content")
+    new_content, changed = _compress_content(content, tool_type)
+    if not changed:
+        return message, False
+    new_msg = copy.deepcopy(message)
+    new_msg["content"] = new_content
+    return new_msg, True
+
+
+def compress_all_tool_results(
+    messages: list[Any],
+    tool_call_index: dict[str, dict[str, Any]],
+) -> tuple[list[Any], dict[str, Any]]:
+    """Apply content-aware truncation to every toolResult in the list."""
+    result = list(messages)
+    compressed_count = 0
+    chars_saved = 0
+
+    for i, msg in enumerate(messages):
+        if not isinstance(msg, dict) or normalize_role(msg.get("role")) != "toolResult":
+            continue
+        original_len = len(extract_text(msg.get("content")))
+        new_msg, changed = compress_tool_result_message(msg, tool_call_index)
+        if changed:
+            result[i] = new_msg
+            compressed_count += 1
+            chars_saved += original_len - len(extract_text(new_msg.get("content")))
+
+    any_changed = compressed_count > 0
+    return (result if any_changed else messages), {
+        "changed": any_changed,
+        "compressedCount": compressed_count,
+        "charsSaved": chars_saved,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Smart tool-result selection  (new)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def select_tool_results_smart(
+    all_result_indices: list[int],
+    messages: list[Any],
+    tool_call_index: dict[str, dict[str, Any]],
+    keep_count: int,
+) -> list[int]:
+    """
+    Select which `keep_count` tool result indices to keep, using these rules:
+
+    1. Deduplicate reads: for the same file path, keep only the most-recent
+       read result (earlier reads of that file are superseded).
+    2. Prioritise test-run outputs — they carry failing-traceback signal.
+    3. Fill remaining slots with the most-recent results.
+
+    Chronological ordering is preserved in the returned list.
+    """
+    if len(all_result_indices) <= keep_count:
+        return all_result_indices
+
+    # Build per-index metadata.
+    meta: list[dict[str, Any]] = []
+    for idx in all_result_indices:
+        msg = messages[idx]
+        tool_info = get_tool_info_for_result(msg, tool_call_index)
+        tool_name = tool_info.get("name", "")
+        tool_input = tool_info.get("input", {})
+        tool_type = classify_tool_type(tool_name, tool_input)
+        file_path = (
+            extract_file_path_from_tool(tool_name, tool_input)
+            if tool_type == "read" else None
+        )
+        meta.append({"idx": idx, "type": tool_type, "file_path": file_path})
+
+    # Deduplicate reads: scan newest-first, keep only first occurrence per path.
+    seen_paths: set[str] = set()
+    deduped: list[dict[str, Any]] = []
+    for m in reversed(meta):
+        if m["type"] == "read" and m["file_path"]:
+            if m["file_path"] in seen_paths:
+                continue  # stale read – superseded by a later read
+            seen_paths.add(m["file_path"])
+        deduped.append(m)
+    deduped.reverse()  # restore chronological order
+
+    if len(deduped) <= keep_count:
+        return [m["idx"] for m in deduped]
+
+    # Among the deduplicated set, prefer to keep test outputs.
+    test_indices = [m["idx"] for m in deduped if m["type"] == "test"]
+    non_test = [m["idx"] for m in deduped if m["type"] != "test"]
+
+    # Always keep up to 2 most-recent test outputs.
+    kept_tests = test_indices[-2:] if len(test_indices) > 2 else test_indices
+    remaining_slots = keep_count - len(kept_tests)
+    kept_non_test = non_test[-remaining_slots:] if remaining_slots > 0 else []
+
+    # Merge and sort by original index to restore chronological order.
+    selected = sorted(set(kept_tests) | set(kept_non_test))
+    return selected
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Structural pruning  (enhanced)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def prune_messages(
+    messages: list[Any],
+    tool_call_index: Optional[dict[str, dict[str, Any]]] = None,
+) -> tuple[list[Any], dict[str, Any]]:
     first_user_index = find_first_user_index(messages)
     if first_user_index is None:
         return messages, {"changed": False, "reason": "missing_first_user_message"}
@@ -362,14 +726,22 @@ def prune_messages(messages: list[Any]) -> tuple[list[Any], dict[str, Any]]:
     if len(tool_result_indices) < KEEP_TOOL_RESULT_COUNT:
         return messages, {
             "changed": False,
-            "reason": "fewer_than_four_tool_results",
+            "reason": "fewer_than_threshold_tool_results",
             "toolResultCount": len(tool_result_indices),
         }
 
-    kept_tool_result_indices = tool_result_indices[-KEEP_TOOL_RESULT_COUNT:]
+    # Smart selection (dedup + priority) when index is available.
+    if tool_call_index is not None:
+        kept_tool_result_indices = select_tool_results_smart(
+            tool_result_indices, messages, tool_call_index, KEEP_TOOL_RESULT_COUNT
+        )
+    else:
+        kept_tool_result_indices = tool_result_indices[-KEEP_TOOL_RESULT_COUNT:]
+
     kept_tool_result_ids: set[str] = set()
     for index in kept_tool_result_indices:
         kept_tool_result_ids.update(extract_tool_result_ids(messages[index]))
+
     tool_call_indices = find_tool_call_indices(messages, kept_tool_result_indices)
     if not tool_call_indices:
         return messages, {"changed": False, "reason": "missing_invoking_tool_call"}
@@ -391,6 +763,10 @@ def prune_messages(messages: list[Any]) -> tuple[list[Any], dict[str, Any]]:
     }
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Top-level handler
+# ─────────────────────────────────────────────────────────────────────────────
+
 def get_messages(payload: dict[str, Any]) -> list[Any]:
     params = get_params(payload)
     messages = params.get("messages") if isinstance(params, dict) else None
@@ -401,21 +777,34 @@ def handle_assemble(payload: dict[str, Any]) -> dict[str, Any]:
     messages = get_messages(payload)
     working_messages, state_metadata, state_path = resolve_stateful_messages(payload, messages)
     runtime_messages, sanitization = sanitize_messages(working_messages)
-    pruned_messages, metadata = prune_messages(runtime_messages)
-    pruned = bool(metadata.get("changed"))
+
+    # Build tool-call index before any compression/pruning.
+    tool_call_index = build_tool_call_index(runtime_messages)
+
+    # Content-aware truncation of every toolResult (in-place, no structural changes).
+    content_compressed, compression_meta = compress_all_tool_results(runtime_messages, tool_call_index)
+
+    # Structural pruning with smart tool-result selection.
+    pruned_messages, prune_meta = prune_messages(content_compressed, tool_call_index)
+
+    pruned   = bool(prune_meta.get("changed"))
     sanitized = bool(sanitization.get("changed"))
+    content_changed = bool(compression_meta.get("changed"))
     output_differs_from_raw = fingerprint_messages(pruned_messages) != fingerprint_messages(messages)
-    changed = pruned or sanitized or output_differs_from_raw
-    reason = metadata.get("reason")
+    changed = pruned or sanitized or content_changed or output_differs_from_raw
+
+    reason = prune_meta.get("reason")
     if pruned:
         reason = "pruned"
+    elif content_changed:
+        reason = "content_compressed"
     elif sanitized:
         reason = "sanitized"
     elif output_differs_from_raw and state_metadata.get("stateLoaded"):
         reason = "state_reused"
 
     metadata = {
-        **metadata,
+        **prune_meta,
         **state_metadata,
         "changed": changed,
         "reason": reason,
@@ -425,6 +814,9 @@ def handle_assemble(payload: dict[str, Any]) -> dict[str, Any]:
         "removedMessageCount": sanitization.get("removedMessageCount", 0),
         "removedThinkingBlockCount": sanitization.get("removedThinkingBlockCount", 0),
         "pruned": pruned,
+        "contentCompressed": content_changed,
+        "compressedToolResultCount": compression_meta.get("compressedCount", 0),
+        "charsSaved": compression_meta.get("charsSaved", 0),
     }
 
     try:
@@ -441,6 +833,10 @@ def handle_assemble(payload: dict[str, Any]) -> dict[str, Any]:
         "baseMiner": metadata,
     }
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CLI entry point
+# ─────────────────────────────────────────────────────────────────────────────
 
 def run_event(event_name: str) -> int:
     try:
