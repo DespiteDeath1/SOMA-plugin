@@ -1,0 +1,466 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#0d0a1a">
+<title>Таро · Карта дня</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+
+  :root {
+    --bg: #0d0a1a;
+    --bg2: #1a1230;
+    --gold: #d4af6a;
+    --gold-bright: #f0d090;
+    --text: #e8e0f0;
+    --muted: #9a8fb8;
+    --card-w: min(46vw, 190px);
+    --card-h: calc(var(--card-w) * 1.65);
+  }
+
+  html, body {
+    height: 100%;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    overflow-x: hidden;
+  }
+
+  body {
+    background:
+      radial-gradient(ellipse at 20% 0%, rgba(120, 80, 200, .22), transparent 55%),
+      radial-gradient(ellipse at 90% 100%, rgba(200, 130, 60, .12), transparent 50%),
+      var(--bg);
+    min-height: 100vh;
+    min-height: 100dvh;
+    padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+    display: flex;
+    flex-direction: column;
+  }
+
+  /* ---------- stars ---------- */
+  .stars { position: fixed; inset: 0; pointer-events: none; z-index: 0; }
+  .star {
+    position: absolute; background: #fff; border-radius: 50%;
+    animation: twinkle 3s ease-in-out infinite;
+  }
+  @keyframes twinkle { 0%,100% { opacity:.15 } 50% { opacity:.85 } }
+
+  header {
+    text-align: center;
+    padding: 28px 16px 10px;
+    position: relative; z-index: 1;
+  }
+  header .moon { font-size: 30px; }
+  header h1 {
+    font-family: "Palatino", "Georgia", serif;
+    font-weight: 600;
+    font-size: 26px;
+    letter-spacing: 6px;
+    color: var(--gold-bright);
+    text-shadow: 0 0 24px rgba(212, 175, 106, .45);
+    margin-top: 6px;
+  }
+  header p { color: var(--muted); font-size: 13px; margin-top: 6px; letter-spacing: 1px; }
+
+  /* ---------- tabs ---------- */
+  .tabs {
+    display: flex; justify-content: center; gap: 10px;
+    padding: 14px 16px 4px; position: relative; z-index: 1;
+  }
+  .tab {
+    border: 1px solid rgba(212,175,106,.35);
+    background: rgba(212,175,106,.07);
+    color: var(--muted);
+    padding: 9px 18px;
+    border-radius: 100px;
+    font-size: 14px;
+    cursor: pointer;
+    transition: all .25s;
+  }
+  .tab.active {
+    color: #1a1230;
+    background: linear-gradient(135deg, var(--gold-bright), var(--gold));
+    border-color: transparent;
+    font-weight: 600;
+    box-shadow: 0 4px 18px rgba(212,175,106,.35);
+  }
+
+  main {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 18px 16px 40px;
+    position: relative; z-index: 1;
+  }
+
+  .hint {
+    color: var(--muted);
+    font-size: 14px;
+    text-align: center;
+    margin-bottom: 18px;
+    min-height: 18px;
+    transition: opacity .3s;
+  }
+
+  /* ---------- cards ---------- */
+  .spread {
+    display: flex;
+    gap: 12px;
+    justify-content: center;
+    flex-wrap: wrap;
+  }
+  .slot { display: flex; flex-direction: column; align-items: center; gap: 8px; }
+  .slot-label {
+    font-size: 12px; letter-spacing: 2px; text-transform: uppercase;
+    color: var(--muted);
+  }
+
+  .card {
+    width: var(--card-w);
+    height: var(--card-h);
+    perspective: 1100px;
+    cursor: pointer;
+  }
+  .spread.three .card {
+    --card-w: min(28vw, 120px);
+    width: var(--card-w);
+    height: calc(var(--card-w) * 1.65);
+  }
+
+  .card-inner {
+    width: 100%; height: 100%;
+    position: relative;
+    transform-style: preserve-3d;
+    transition: transform .8s cubic-bezier(.4, .1, .2, 1);
+  }
+  .card.flipped .card-inner { transform: rotateY(180deg); }
+
+  .face {
+    position: absolute; inset: 0;
+    backface-visibility: hidden;
+    -webkit-backface-visibility: hidden;
+    border-radius: 14px;
+    overflow: hidden;
+  }
+
+  /* back of card */
+  .face.back {
+    background:
+      repeating-linear-gradient(45deg, rgba(212,175,106,.12) 0 2px, transparent 2px 14px),
+      repeating-linear-gradient(-45deg, rgba(212,175,106,.12) 0 2px, transparent 2px 14px),
+      linear-gradient(160deg, #241a45, #140e2b);
+    border: 2px solid rgba(212,175,106,.5);
+    display: flex; align-items: center; justify-content: center;
+    box-shadow: 0 10px 30px rgba(0,0,0,.5);
+  }
+  .face.back::after {
+    content: "✦";
+    font-size: 42px;
+    color: var(--gold);
+    text-shadow: 0 0 20px rgba(212,175,106,.8);
+  }
+
+  /* front of card */
+  .face.front {
+    transform: rotateY(180deg);
+    background: linear-gradient(170deg, #2a1f52 0%, #171033 70%);
+    border: 2px solid var(--gold);
+    display: flex; flex-direction: column;
+    align-items: center; justify-content: space-between;
+    padding: 10px 6px;
+    box-shadow: 0 10px 34px rgba(212,175,106,.25);
+  }
+  .front .num { font-size: 11px; color: var(--gold); letter-spacing: 2px; }
+  .front .sym {
+    font-size: calc(var(--card-w) * .34);
+    filter: drop-shadow(0 0 14px rgba(212,175,106,.45));
+    transition: transform .4s;
+  }
+  .card.reversed .front .sym { transform: rotate(180deg); }
+  .front .nm {
+    font-family: "Palatino", "Georgia", serif;
+    font-size: calc(var(--card-w) * .085);
+    text-align: center;
+    color: var(--gold-bright);
+    letter-spacing: 1px;
+    line-height: 1.25;
+  }
+  .front .rev-tag {
+    font-size: 10px; color: #c98a8a; letter-spacing: 1px; min-height: 12px;
+  }
+
+  .card.dealing { animation: deal .5s ease both; }
+  @keyframes deal {
+    from { transform: translateY(40px) scale(.85); opacity: 0; }
+    to   { transform: none; opacity: 1; }
+  }
+
+  /* ---------- meaning panel ---------- */
+  .meaning {
+    margin-top: 26px;
+    max-width: 520px;
+    width: 100%;
+    display: none;
+    flex-direction: column;
+    gap: 14px;
+  }
+  .meaning.show { display: flex; animation: fadeUp .5s ease both; }
+  @keyframes fadeUp { from { opacity:0; transform: translateY(16px);} to { opacity:1; transform:none;} }
+
+  .m-card {
+    background: rgba(255,255,255,.045);
+    border: 1px solid rgba(212,175,106,.25);
+    border-radius: 16px;
+    padding: 16px 18px;
+    backdrop-filter: blur(6px);
+  }
+  .m-card h3 {
+    font-family: "Palatino", "Georgia", serif;
+    color: var(--gold-bright);
+    font-size: 17px;
+    margin-bottom: 4px;
+  }
+  .m-card .pos { font-size: 11px; letter-spacing: 2px; text-transform: uppercase; color: var(--muted); margin-bottom: 8px; }
+  .m-card .rev { color: #d99; }
+  .m-card p { font-size: 14.5px; line-height: 1.6; color: var(--text); }
+  .m-card .kw { margin-top: 10px; display: flex; flex-wrap: wrap; gap: 6px; }
+  .m-card .kw span {
+    font-size: 12px; color: var(--gold);
+    border: 1px solid rgba(212,175,106,.35);
+    padding: 3px 10px; border-radius: 100px;
+  }
+
+  /* ---------- button ---------- */
+  .btn {
+    margin-top: 30px;
+    border: none;
+    background: linear-gradient(135deg, var(--gold-bright), #b8923f);
+    color: #1d142e;
+    font-size: 16px;
+    font-weight: 700;
+    letter-spacing: 1px;
+    padding: 15px 42px;
+    border-radius: 100px;
+    cursor: pointer;
+    box-shadow: 0 6px 24px rgba(212,175,106,.4);
+    transition: transform .15s, box-shadow .15s;
+  }
+  .btn:active { transform: scale(.96); box-shadow: 0 3px 12px rgba(212,175,106,.3); }
+
+  footer {
+    text-align: center; color: rgba(154,143,184,.5);
+    font-size: 11px; padding: 0 0 18px; letter-spacing: 1px;
+    position: relative; z-index: 1;
+  }
+</style>
+</head>
+<body>
+
+<div class="stars" id="stars"></div>
+
+<header>
+  <div class="moon">🌙</div>
+  <h1>ТАРО</h1>
+  <p>прислушайся к голосу карт</p>
+</header>
+
+<div class="tabs">
+  <button class="tab active" data-mode="one">Карта дня</button>
+  <button class="tab" data-mode="three">Расклад на 3 карты</button>
+</div>
+
+<main>
+  <div class="hint" id="hint">Коснись карты, чтобы открыть её</div>
+  <div class="spread" id="spread"></div>
+  <div class="meaning" id="meaning"></div>
+  <button class="btn" id="again" style="display:none">Новый расклад ✦</button>
+</main>
+
+<footer>✦ старшие арканы · 22 карты ✦</footer>
+
+<script>
+const DECK = [
+  { n:"0", name:"Шут", sym:"🃏", kw:["начало","свобода","спонтанность"],
+    up:"Перед тобой открывается новый путь. Доверься потоку жизни и сделай шаг в неизвестность — сейчас удачное время для смелых начинаний.",
+    rev:"Будь осторожен с необдуманными решениями. Лёгкость может обернуться легкомыслием — взвесь риски, прежде чем прыгать." },
+  { n:"I", name:"Маг", sym:"✨", kw:["воля","мастерство","действие"],
+    up:"У тебя есть все инструменты, чтобы воплотить задуманное. Сила намерения сейчас велика — действуй уверенно.",
+    rev:"Энергия рассеивается впустую. Возможны манипуляции или самообман. Сосредоточься на одной цели." },
+  { n:"II", name:"Верховная Жрица", sym:"🌙", kw:["интуиция","тайна","знание"],
+    up:"Ответ уже внутри тебя. Прислушайся к интуиции и не спеши с выводами — тайное скоро станет явным.",
+    rev:"Ты игнорируешь внутренний голос. Поверхностные суждения мешают увидеть суть. Остановись и прислушайся к себе." },
+  { n:"III", name:"Императрица", sym:"🌾", kw:["изобилие","забота","рост"],
+    up:"Период расцвета и плодородия. Всё, что ты взращиваешь — отношения, проекты, идеи — принесёт богатые плоды.",
+    rev:"Возможен творческий застой или чрезмерная опека. Не забывай заботиться о себе так же, как о других." },
+  { n:"IV", name:"Император", sym:"👑", kw:["порядок","власть","стабильность"],
+    up:"Время структуры и дисциплины. Возьми ситуацию под контроль — твёрдость и порядок приведут к успеху.",
+    rev:"Жёсткость превращается в упрямство. Контроль душит живое — ослабь хватку и позволь событиям развиваться." },
+  { n:"V", name:"Иерофант", sym:"🕯️", kw:["традиция","учение","наставник"],
+    up:"Обратись к проверенным знаниям и традициям. Рядом может появиться мудрый наставник — прислушайся к его совету.",
+    rev:"Чужие правила тебе тесны. Возможно, пришло время найти собственный путь, а не следовать догмам." },
+  { n:"VI", name:"Влюблённые", sym:"💞", kw:["выбор","любовь","союз"],
+    up:"Гармония в отношениях и важный выбор сердцем. Союз, заключённый сейчас, обещает быть искренним.",
+    rev:"Разлад или сложный выбор. Не игнорируй внутренний конфликт — честность с собой важнее всего." },
+  { n:"VII", name:"Колесница", sym:"🏇", kw:["победа","движение","воля"],
+    up:"Уверенное движение к цели. Держи поводья крепко — победа близка, если не сворачивать с пути.",
+    rev:"Потеря контроля или движение без направления. Останови колесницу и сверься с картой пути." },
+  { n:"VIII", name:"Сила", sym:"🦁", kw:["мужество","терпение","мягкая сила"],
+    up:"Истинная сила — в мягкости и терпении. Ты способен укротить любые обстоятельства спокойствием духа.",
+    rev:"Сомнения в себе или подавленный гнев. Восстанови внутреннюю опору — сила вернётся." },
+  { n:"IX", name:"Отшельник", sym:"🏮", kw:["поиск","уединение","мудрость"],
+    up:"Время заглянуть внутрь себя. Уединение даст ответы, которых не найти во внешней суете.",
+    rev:"Изоляция затянулась. Не отгораживайся от мира — некоторые ответы приходят только через людей." },
+  { n:"X", name:"Колесо Фортуны", sym:"🎡", kw:["судьба","перемены","цикл"],
+    up:"Колесо поворачивается в твою пользу. Перемены неизбежны — встречай их с открытым сердцем.",
+    rev:"Полоса неудач временна. Не цепляйся за уходящее — цикл завершается, чтобы начался новый." },
+  { n:"XI", name:"Справедливость", sym:"⚖️", kw:["истина","баланс","закон"],
+    up:"Всё тайное становится явным, и каждому воздастся по заслугам. Действуй честно — равновесие на твоей стороне.",
+    rev:"Несправедливость или нежелание признать правду. Посмотри на ситуацию без предвзятости." },
+  { n:"XII", name:"Повешенный", sym:"🙃", kw:["пауза","жертва","новый взгляд"],
+    up:"Отпусти контроль и посмотри на всё под другим углом. Пауза сейчас — не потеря, а обретение.",
+    rev:"Бессмысленная жертва или застревание. Хватит висеть — пора принять решение и двигаться." },
+  { n:"XIII", name:"Смерть", sym:"🦋", kw:["трансформация","завершение","обновление"],
+    up:"Старое уходит, освобождая место новому. Не бойся завершений — это начало глубокой трансформации.",
+    rev:"Сопротивление неизбежным переменам. Чем крепче держишься за прошлое, тем больнее перемены." },
+  { n:"XIV", name:"Умеренность", sym:"🕊️", kw:["гармония","мера","исцеление"],
+    up:"Время баланса и исцеления. Смешивай противоположности с терпением — золотая середина найдётся.",
+    rev:"Крайности и дисбаланс. Что-то в жизни требует умеренности — найди, где ты перегибаешь." },
+  { n:"XV", name:"Дьявол", sym:"⛓️", kw:["зависимость","искушение","тень"],
+    up:"Осознай свои цепи: страхи, привычки, зависимости. Они держат только пока ты не видишь, что замок открыт.",
+    rev:"Освобождение близко. Ты разрываешь старые путы — продолжай, свет уже виден." },
+  { n:"XVI", name:"Башня", sym:"🌩️", kw:["разрушение","озарение","перелом"],
+    up:"Внезапное разрушение иллюзий. Это больно, но рушится лишь то, что было построено на песке.",
+    rev:"Кризис отступает или избегается. Используй встряску, чтобы укрепить фундамент жизни." },
+  { n:"XVII", name:"Звезда", sym:"⭐", kw:["надежда","вдохновение","вера"],
+    up:"После бури приходит тишина и надежда. Звезда ведёт тебя — верь мечте, она осуществима.",
+    rev:"Вера ослабла, вдохновение угасло. Звезда не исчезла — её просто закрыли тучи. Они пройдут." },
+  { n:"XVIII", name:"Луна", sym:"🌕", kw:["иллюзии","сны","подсознание"],
+    up:"Не всё то, чем кажется. Доверяй интуиции, но проверяй факты — туман скоро рассеется.",
+    rev:"Страхи и иллюзии теряют власть. Ясность возвращается — скоро ты увидишь истинную картину." },
+  { n:"XIX", name:"Солнце", sym:"☀️", kw:["радость","успех","ясность"],
+    up:"Одна из самых светлых карт. Радость, успех и ясность освещают твой путь — наслаждайся этим временем.",
+    rev:"Свет есть, но ты его не замечаешь. Временные облака не отменяют солнца — позволь себе радоваться." },
+  { n:"XX", name:"Суд", sym:"🎺", kw:["пробуждение","призвание","итог"],
+    up:"Час пробуждения. Прошлое подводит итоги, и звучит зов нового призвания — ответь на него.",
+    rev:"Самокритика мешает услышать зов. Прости себе прошлое — иначе не шагнуть в будущее." },
+  { n:"XXI", name:"Мир", sym:"🌍", kw:["завершение","целостность","триумф"],
+    up:"Цикл завершён, цель достигнута. Ты обрёл целостность — празднуй и готовься к новому витку.",
+    rev:"Незавершённость держит на месте. Закрой старые гештальты — мир ждёт твоего следующего шага." },
+];
+
+const POSITIONS = { one: ["Карта дня"], three: ["Прошлое", "Настоящее", "Будущее"] };
+
+const spreadEl = document.getElementById("spread");
+const meaningEl = document.getElementById("meaning");
+const hintEl = document.getElementById("hint");
+const againBtn = document.getElementById("again");
+
+let mode = "one";
+let drawn = [];
+let openedCount = 0;
+
+function shuffleDraw(count) {
+  const idx = [...DECK.keys()];
+  for (let i = idx.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [idx[i], idx[j]] = [idx[j], idx[i]];
+  }
+  return idx.slice(0, count).map(i => ({
+    card: DECK[i],
+    reversed: Math.random() < 0.3
+  }));
+}
+
+function deal() {
+  const positions = POSITIONS[mode];
+  drawn = shuffleDraw(positions.length);
+  openedCount = 0;
+  meaningEl.classList.remove("show");
+  meaningEl.innerHTML = "";
+  againBtn.style.display = "none";
+  hintEl.textContent = positions.length > 1
+    ? "Открывай карты по одной, слева направо"
+    : "Коснись карты, чтобы открыть её";
+
+  spreadEl.className = "spread" + (positions.length === 3 ? " three" : "");
+  spreadEl.innerHTML = "";
+
+  drawn.forEach((d, i) => {
+    const slot = document.createElement("div");
+    slot.className = "slot";
+    const label = document.createElement("div");
+    label.className = "slot-label";
+    label.textContent = positions[i];
+
+    const card = document.createElement("div");
+    card.className = "card dealing" + (d.reversed ? " reversed" : "");
+    card.style.animationDelay = (i * 0.12) + "s";
+    card.innerHTML = `
+      <div class="card-inner">
+        <div class="face back"></div>
+        <div class="face front">
+          <div class="num">${d.card.n}</div>
+          <div class="sym">${d.card.sym}</div>
+          <div class="nm">${d.card.name}</div>
+          <div class="rev-tag">${d.reversed ? "перевёрнутая" : ""}</div>
+        </div>
+      </div>`;
+
+    card.addEventListener("click", () => openCard(card, d, positions[i]), { once: true });
+    slot.appendChild(label);
+    slot.appendChild(card);
+    spreadEl.appendChild(slot);
+  });
+}
+
+function openCard(cardEl, d, position) {
+  cardEl.classList.add("flipped");
+  if (navigator.vibrate) navigator.vibrate(15);
+
+  const m = document.createElement("div");
+  m.className = "m-card";
+  m.innerHTML = `
+    <div class="pos">${position}${d.reversed ? ' · <span class="rev">перевёрнутая</span>' : ""}</div>
+    <h3>${d.card.sym} ${d.card.name}</h3>
+    <p>${d.reversed ? d.card.rev : d.card.up}</p>
+    <div class="kw">${d.card.kw.map(k => `<span>${k}</span>`).join("")}</div>`;
+  meaningEl.appendChild(m);
+  meaningEl.classList.add("show");
+
+  openedCount++;
+  if (openedCount === drawn.length) {
+    hintEl.textContent = "✦ Расклад завершён ✦";
+    againBtn.style.display = "inline-block";
+  }
+}
+
+document.querySelectorAll(".tab").forEach(tab => {
+  tab.addEventListener("click", () => {
+    document.querySelectorAll(".tab").forEach(t => t.classList.remove("active"));
+    tab.classList.add("active");
+    mode = tab.dataset.mode;
+    deal();
+  });
+});
+
+againBtn.addEventListener("click", deal);
+
+// stars background
+const starsEl = document.getElementById("stars");
+for (let i = 0; i < 60; i++) {
+  const s = document.createElement("div");
+  s.className = "star";
+  const size = Math.random() * 2 + 1;
+  s.style.cssText = `width:${size}px;height:${size}px;left:${Math.random()*100}%;top:${Math.random()*100}%;animation-delay:${Math.random()*3}s;`;
+  starsEl.appendChild(s);
+}
+
+deal();
+</script>
+</body>
+</html>
